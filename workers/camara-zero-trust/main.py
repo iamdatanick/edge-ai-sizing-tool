@@ -126,10 +126,250 @@ POLICY_ENGINE = None
 AUDIT_PLANE = None
 HTTP_CLIENT: httpx.AsyncClient = None  # Shared client for connection pooling
 
+# Circuit breaker for MCP calls (initialized after class definitions below)
+MCP_CIRCUIT_BREAKER: "CircuitBreaker" = None
+
+# Rate limiters (initialized after class definitions below)
+VERIFY_RATE_LIMITER: "RateLimiter" = None
+PROXY_RATE_LIMITER: "RateLimiter" = None
+
 import re
+from enum import Enum
+from dataclasses import dataclass, field
+from collections import defaultdict
 
 # Phone validation pattern
 PHONE_PATTERN = re.compile(r'^\+[1-9]\d{6,14}$')
+
+# ============================================================================
+# CIRCUIT BREAKER PATTERN (from agentic-workflows)
+# ============================================================================
+
+class CircuitState(Enum):
+    """Circuit breaker states."""
+    CLOSED = "closed"      # Normal operation
+    OPEN = "open"          # Failing, rejecting calls
+    HALF_OPEN = "half_open"  # Testing if service recovered
+
+
+class CircuitBreakerOpen(Exception):
+    """Raised when circuit is open and call is rejected."""
+    def __init__(self, name: str, retry_after: float):
+        self.name = name
+        self.retry_after = retry_after
+        super().__init__(f"Circuit breaker '{name}' is open. Retry after {retry_after:.1f}s")
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """Circuit breaker configuration."""
+    failure_threshold: int = 5
+    success_threshold: int = 2
+    timeout_seconds: float = 30.0
+    failure_window_seconds: float = 60.0
+
+
+class CircuitBreaker:
+    """Circuit breaker for failure isolation."""
+
+    def __init__(self, name: str, config: CircuitBreakerConfig = None):
+        self.name = name
+        self.config = config or CircuitBreakerConfig()
+        self._state = CircuitState.CLOSED
+        self._failure_timestamps: List[float] = []
+        self._consecutive_failures = 0
+        self._consecutive_successes = 0
+        self._opened_at: Optional[float] = None
+        self._lock = asyncio.Lock()
+
+        # Stats
+        self.total_calls = 0
+        self.successful_calls = 0
+        self.failed_calls = 0
+        self.rejected_calls = 0
+
+    @property
+    def state(self) -> CircuitState:
+        return self._state
+
+    async def call(self, func, *args, **kwargs):
+        """Execute async function through circuit breaker."""
+        self.total_calls += 1
+
+        async with self._lock:
+            self._maybe_transition_to_half_open()
+
+            if self._state == CircuitState.OPEN:
+                self.rejected_calls += 1
+                retry_after = self._get_retry_after()
+                raise CircuitBreakerOpen(self.name, retry_after)
+
+        try:
+            result = await func(*args, **kwargs)
+            await self._record_success()
+            return result
+        except Exception as e:
+            await self._record_failure()
+            raise
+
+    async def _record_success(self):
+        self.successful_calls += 1
+        async with self._lock:
+            self._consecutive_failures = 0
+            self._consecutive_successes += 1
+
+            if self._state == CircuitState.HALF_OPEN:
+                if self._consecutive_successes >= self.config.success_threshold:
+                    self._transition_to(CircuitState.CLOSED)
+
+    async def _record_failure(self):
+        self.failed_calls += 1
+        now = time.time()
+
+        async with self._lock:
+            self._consecutive_successes = 0
+            self._consecutive_failures += 1
+            self._failure_timestamps.append(now)
+
+            # Clean old failures outside window
+            cutoff = now - self.config.failure_window_seconds
+            self._failure_timestamps = [t for t in self._failure_timestamps if t > cutoff]
+
+            if self._state == CircuitState.HALF_OPEN:
+                self._transition_to(CircuitState.OPEN)
+            elif self._state == CircuitState.CLOSED:
+                if len(self._failure_timestamps) >= self.config.failure_threshold:
+                    self._transition_to(CircuitState.OPEN)
+
+    def _maybe_transition_to_half_open(self):
+        if self._state != CircuitState.OPEN or self._opened_at is None:
+            return
+        if time.time() - self._opened_at >= self.config.timeout_seconds:
+            self._transition_to(CircuitState.HALF_OPEN)
+
+    def _transition_to(self, new_state: CircuitState):
+        old_state = self._state
+        self._state = new_state
+        logging.info(f"[CIRCUIT] {self.name}: {old_state.value} -> {new_state.value}")
+
+        if new_state == CircuitState.OPEN:
+            self._opened_at = time.time()
+        elif new_state == CircuitState.HALF_OPEN:
+            self._consecutive_successes = 0
+        elif new_state == CircuitState.CLOSED:
+            self._opened_at = None
+            self._failure_timestamps = []
+            self._consecutive_failures = 0
+
+    def _get_retry_after(self) -> float:
+        if self._opened_at is None:
+            return 0.0
+        elapsed = time.time() - self._opened_at
+        return max(0, self.config.timeout_seconds - elapsed)
+
+    def reset(self):
+        self._state = CircuitState.CLOSED
+        self._opened_at = None
+        self._failure_timestamps = []
+        self._consecutive_failures = 0
+        self._consecutive_successes = 0
+
+    def get_status(self) -> dict:
+        return {
+            "name": self.name,
+            "state": self._state.value,
+            "consecutive_failures": self._consecutive_failures,
+            "retry_after": self._get_retry_after() if self._state == CircuitState.OPEN else 0,
+            "stats": {
+                "total": self.total_calls,
+                "successful": self.successful_calls,
+                "failed": self.failed_calls,
+                "rejected": self.rejected_calls,
+            }
+        }
+
+
+# ============================================================================
+# RATE LIMITER (Token Bucket Algorithm)
+# ============================================================================
+
+@dataclass
+class RateLimitConfig:
+    """Rate limiter configuration."""
+    requests_per_second: float = 10.0  # Token refill rate
+    burst_size: int = 20               # Maximum burst capacity
+    per_phone: bool = True             # Rate limit per phone number
+
+
+class RateLimiter:
+    """Token bucket rate limiter with per-key support."""
+
+    def __init__(self, config: RateLimitConfig = None):
+        self.config = config or RateLimitConfig()
+        self._buckets: Dict[str, Tuple[float, float]] = {}  # key -> (tokens, last_update)
+        self._lock = asyncio.Lock()
+
+        # Stats
+        self.total_requests = 0
+        self.allowed_requests = 0
+        self.rejected_requests = 0
+
+    async def acquire(self, key: str = "global") -> Tuple[bool, float]:
+        """Try to acquire a token. Returns (allowed, retry_after)."""
+        self.total_requests += 1
+
+        async with self._lock:
+            now = time.time()
+
+            # Get or create bucket
+            if key not in self._buckets:
+                self._buckets[key] = (self.config.burst_size, now)
+
+            tokens, last_update = self._buckets[key]
+
+            # Refill tokens based on elapsed time
+            elapsed = now - last_update
+            tokens = min(
+                self.config.burst_size,
+                tokens + elapsed * self.config.requests_per_second
+            )
+
+            if tokens >= 1.0:
+                # Allow request
+                self._buckets[key] = (tokens - 1.0, now)
+                self.allowed_requests += 1
+                return (True, 0.0)
+            else:
+                # Reject - calculate retry time
+                self._buckets[key] = (tokens, now)
+                retry_after = (1.0 - tokens) / self.config.requests_per_second
+                self.rejected_requests += 1
+                return (False, retry_after)
+
+    async def check(self, phone: str = None) -> Tuple[bool, float]:
+        """Check rate limit for a request."""
+        if self.config.per_phone and phone:
+            # Normalize phone for consistent keying
+            key = phone.replace("+", "").replace(" ", "")
+        else:
+            key = "global"
+        return await self.acquire(key)
+
+    def get_stats(self) -> dict:
+        return {
+            "total_requests": self.total_requests,
+            "allowed": self.allowed_requests,
+            "rejected": self.rejected_requests,
+            "rejection_rate": self.rejected_requests / max(1, self.total_requests),
+            "active_buckets": len(self._buckets),
+        }
+
+
+class RateLimitExceeded(Exception):
+    """Raised when rate limit is exceeded."""
+    def __init__(self, retry_after: float):
+        self.retry_after = retry_after
+        super().__init__(f"Rate limit exceeded. Retry after {retry_after:.2f}s")
 
 def validate_phone(phone: str) -> str:
     """Validate phone number format."""
@@ -269,17 +509,19 @@ def update_payload_status(workload_id: int, status: str, port: int):
 # ============================================================================
 
 class MCPManager:
-    """Manage MCP connection lifecycle."""
+    """Manage MCP connection lifecycle with circuit breaker protection."""
     def __init__(self):
         self.session = None
         self.connected = False
         self._sse_context = None
         self._session_context = None
-    
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 3
+
     async def connect(self):
         if not MCP_AVAILABLE:
             return False
-        
+
         try:
             self._sse_context = sse_client(MCP_URL)
             read, write = await self._sse_context.__aenter__()
@@ -287,13 +529,15 @@ class MCPManager:
             self.session = await self._session_context.__aenter__()
             await self.session.initialize()
             self.connected = True
+            self._reconnect_attempts = 0
             logging.info("MCP connected")
             return True
         except Exception as e:
             logging.error(f"MCP connection failed: {e}")
             self.connected = False
+            self._reconnect_attempts += 1
             return False
-    
+
     async def disconnect(self):
         """Disconnect with timeout to prevent hanging on shutdown."""
         try:
@@ -307,26 +551,81 @@ class MCPManager:
         except Exception:
             pass
         self.connected = False
-    
+
+    async def _raw_call_tool(self, tool: str, params: dict) -> Tuple[str, str, float]:
+        """Internal tool call without circuit breaker (used by circuit breaker wrapper)."""
+        if not self.connected or not self.session:
+            raise ConnectionError("MCP not connected")
+
+        start = time.time()
+        result = await asyncio.wait_for(
+            self.session.call_tool(tool, params),
+            timeout=15.0
+        )
+        text = result.content[0].text if result.content else ""
+        elapsed = (time.time() - start) * 1000
+        return ("OK", text[:200], elapsed)
+
     async def call_tool(self, tool: str, params: dict) -> Tuple[str, str, float]:
+        """Call MCP tool with circuit breaker protection."""
+        global MCP_CIRCUIT_BREAKER
+
         if not self.connected or not self.session:
             return ("ERROR", "MCP not connected", 0)
-        
+
         start = time.time()
-        try:
-            result = await asyncio.wait_for(
-                self.session.call_tool(tool, params),
-                timeout=15.0
-            )
-            text = result.content[0].text if result.content else ""
-            elapsed = (time.time() - start) * 1000
-            return ("OK", text[:200], elapsed)
-        except asyncio.TimeoutError:
-            return ("TIMEOUT", "Timeout", (time.time() - start) * 1000)
-        except Exception as e:
-            return ("ERROR", str(e)[:100], (time.time() - start) * 1000)
+
+        # Use circuit breaker if available
+        if MCP_CIRCUIT_BREAKER:
+            try:
+                return await MCP_CIRCUIT_BREAKER.call(self._raw_call_tool, tool, params)
+            except CircuitBreakerOpen as e:
+                logging.warning(f"[CIRCUIT] MCP circuit open, using fallback for {tool}")
+                return ("CIRCUIT_OPEN", f"Circuit breaker open, retry in {e.retry_after:.1f}s", 0)
+            except asyncio.TimeoutError:
+                return ("TIMEOUT", "Timeout", (time.time() - start) * 1000)
+            except ConnectionError as e:
+                return ("ERROR", str(e), (time.time() - start) * 1000)
+            except Exception as e:
+                return ("ERROR", str(e)[:100], (time.time() - start) * 1000)
+        else:
+            # Fallback without circuit breaker
+            try:
+                return await self._raw_call_tool(tool, params)
+            except asyncio.TimeoutError:
+                return ("TIMEOUT", "Timeout", (time.time() - start) * 1000)
+            except Exception as e:
+                return ("ERROR", str(e)[:100], (time.time() - start) * 1000)
+
 
 MCP_MANAGER = MCPManager()
+
+# Initialize circuit breaker and rate limiters after class definitions
+MCP_CIRCUIT_BREAKER = CircuitBreaker(
+    "mcp-camara",
+    CircuitBreakerConfig(
+        failure_threshold=5,      # Open after 5 failures
+        success_threshold=2,      # Close after 2 successes in half-open
+        timeout_seconds=30.0,     # Try again after 30s
+        failure_window_seconds=60.0  # Count failures within 60s window
+    )
+)
+
+VERIFY_RATE_LIMITER = RateLimiter(
+    RateLimitConfig(
+        requests_per_second=5.0,   # 5 req/s per phone
+        burst_size=10,             # Allow burst of 10
+        per_phone=True
+    )
+)
+
+PROXY_RATE_LIMITER = RateLimiter(
+    RateLimitConfig(
+        requests_per_second=2.0,   # 2 req/s per phone (more restrictive for inference)
+        burst_size=5,              # Allow burst of 5
+        per_phone=True
+    )
+)
 
 # ============================================================================
 # CAMARA VERIFICATION
@@ -416,17 +715,65 @@ async def verify_phone(phone: str, operator: str, sensitivity: str) -> VerifyRes
             latency_ms=(time.time() - start_time) * 1000
         )
     else:
-        # Fallback evaluation - require majority of checks to pass
-        ok_count = sum(1 for e in evidence if
-                      (e.status if hasattr(e, 'status') else e.get('status')) == "OK")
+        # Fallback evaluation with circuit breaker awareness
+        ok_count = 0
+        circuit_open_count = 0
+        error_count = 0
         total_checks = len(evidence)
-        # Require majority to pass, minimum 1 (handles single-check operators)
-        allow = total_checks > 0 and ok_count >= max(1, (total_checks + 1) // 2)
+
+        for e in evidence:
+            status = e.status if hasattr(e, 'status') else e.get('status')
+            if status == "OK":
+                ok_count += 1
+            elif status == "CIRCUIT_OPEN":
+                circuit_open_count += 1
+            else:
+                error_count += 1
+
+        # Determine decision based on evidence
+        reason_codes = ["FALLBACK_EVAL"]
+
+        if circuit_open_count == total_checks:
+            # All checks blocked by circuit breaker - use degraded mode
+            # Allow with elevated risk for non-sensitive requests
+            if sensitivity == "general":
+                allow = True
+                decision = "GRANT_LIMITED"
+                scope = "LIMITED_ACCESS"
+                risk_score = 75  # Elevated risk due to missing verification
+                reason_codes.extend(["CIRCUIT_BREAKER_DEGRADED", "ELEVATED_RISK"])
+                logging.warning(f"[VERIFY] Circuit breaker degraded mode - allowing {mask_phone(phone)} with elevated risk")
+            else:
+                # Deny for financial/medical sensitivity when circuit is open
+                allow = False
+                decision = "DENY"
+                scope = "NONE"
+                risk_score = 100
+                reason_codes.extend(["CIRCUIT_BREAKER_BLOCK", f"SENSITIVE_{sensitivity.upper()}"])
+                logging.warning(f"[VERIFY] Circuit breaker block - denying {sensitivity} request for {mask_phone(phone)}")
+        elif circuit_open_count > 0:
+            # Partial circuit open - evaluate available checks
+            available_ok = ok_count
+            available_total = total_checks - circuit_open_count
+            # Require majority of available checks to pass
+            allow = available_total > 0 and available_ok >= max(1, (available_total + 1) // 2)
+            decision = "GRANT_FULL" if allow else "DENY"
+            scope = "FULL_ACCESS" if allow else "NONE"
+            risk_score = min(100, (available_total - available_ok) * 25 + circuit_open_count * 15)
+            reason_codes.extend([f"CHECKS_{ok_count}_OF_{available_total}", f"CIRCUIT_OPEN_{circuit_open_count}"])
+        else:
+            # Normal fallback - require majority of checks to pass
+            allow = total_checks > 0 and ok_count >= max(1, (total_checks + 1) // 2)
+            decision = "GRANT_FULL" if allow else "DENY"
+            scope = "FULL_ACCESS" if allow else "NONE"
+            risk_score = min(100, (total_checks - ok_count) * 25) if total_checks > 0 else 100
+            reason_codes.append(f"CHECKS_{ok_count}_OF_{total_checks}")
+
         return VerifyResponse(
-            decision="GRANT_FULL" if allow else "DENY",
-            scope="FULL_ACCESS" if allow else "NONE",
-            risk_score=min(100, (total_checks - ok_count) * 25) if total_checks > 0 else 100,
-            reason_codes=["FALLBACK_EVAL", f"CHECKS_{ok_count}_OF_{total_checks}"],
+            decision=decision,
+            scope=scope,
+            risk_score=risk_score,
+            reason_codes=reason_codes,
             allow=allow,
             operator=operator,
             phone_masked=mask_phone(phone),
@@ -648,8 +995,8 @@ def create_app(args):
     
     app = FastAPI(
         title="CAMARA Zero Trust Proxy",
-        description="Zero Trust AI inference gateway for Intel EAST",
-        version="2.0.0",
+        description="Zero Trust AI inference gateway for Intel EAST with circuit breaker and rate limiting",
+        version="2.1.0",
         lifespan=lifespan
     )
     
@@ -683,7 +1030,24 @@ def create_app(args):
             "mcp_connected": MCP_MANAGER.connected,
             "model_loaded": PIPE is not None,
             "v6_available": V6_AVAILABLE,
-            "proxy_mode": True
+            "proxy_mode": True,
+            "circuit_breaker": MCP_CIRCUIT_BREAKER.get_status() if MCP_CIRCUIT_BREAKER else None,
+        }
+
+    @app.get("/status")
+    async def status():
+        """Detailed status including circuit breaker and rate limiter stats."""
+        return {
+            "worker": "camara-zero-trust-proxy",
+            "version": "2.1.0",
+            "mcp_connected": MCP_MANAGER.connected,
+            "circuit_breaker": MCP_CIRCUIT_BREAKER.get_status() if MCP_CIRCUIT_BREAKER else None,
+            "rate_limiters": {
+                "verify": VERIFY_RATE_LIMITER.get_stats() if VERIFY_RATE_LIMITER else None,
+                "proxy": PROXY_RATE_LIMITER.get_stats() if PROXY_RATE_LIMITER else None,
+            },
+            "policy_engine": POLICY_ENGINE is not None,
+            "audit_plane": AUDIT_PLANE is not None,
         }
     
     @app.get("/workloads", response_model=List[WorkloadInfo])
@@ -694,9 +1058,20 @@ def create_app(args):
     @app.post("/verify", response_model=VerifyResponse)
     async def verify(request: VerifyRequest):
         """CAMARA verification only (no inference)."""
+        # Rate limiting
+        if VERIFY_RATE_LIMITER:
+            allowed, retry_after = await VERIFY_RATE_LIMITER.check(request.phone_number)
+            if not allowed:
+                logging.warning(f"[RATE_LIMIT] Verify rate limit exceeded for {mask_phone(request.phone_number)}")
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limit exceeded. Retry after {retry_after:.2f}s",
+                    headers={"Retry-After": str(int(retry_after) + 1)}
+                )
+
         if not MCP_MANAGER.connected:
             await MCP_MANAGER.connect()
-        
+
         return await verify_phone(
             request.phone_number,
             request.operator,
@@ -707,15 +1082,27 @@ def create_app(args):
     async def proxy(request: ProxyRequest):
         """
         MAIN ENDPOINT: Verify phone, then proxy to target worker.
-        
+
         This is the Zero Trust gateway - all inference should go through here.
+        Includes rate limiting and circuit breaker protection.
         """
         total_start = time.time()
-        
+
+        # Rate limiting (more restrictive for proxy/inference)
+        if PROXY_RATE_LIMITER:
+            allowed, retry_after = await PROXY_RATE_LIMITER.check(request.phone_number)
+            if not allowed:
+                logging.warning(f"[RATE_LIMIT] Proxy rate limit exceeded for {mask_phone(request.phone_number)}")
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limit exceeded. Retry after {retry_after:.2f}s",
+                    headers={"Retry-After": str(int(retry_after) + 1)}
+                )
+
         # Lazy connect MCP
         if not MCP_MANAGER.connected:
             await MCP_MANAGER.connect()
-        
+
         # Step 1: CAMARA verification
         logging.info(f"[PROXY] Verifying {mask_phone(request.phone_number)}")
         verification = await verify_phone(
@@ -883,10 +1270,10 @@ def create_app(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    
+
     print(f"""
 ================================================================================
-           CAMARA Zero Trust Proxy for Intel EAST v2.0
+           CAMARA Zero Trust Proxy for Intel EAST v2.1
 ================================================================================
   Mode:     {'Proxy + Local Model' if args.model_name else 'Proxy Only'}
   Port:     {args.port}
@@ -895,13 +1282,20 @@ if __name__ == "__main__":
   MCP:      {MCP_URL}
   EAST:     {EAST_API_URL}
   V6 Root:  {CAMARA_V6_ROOT}
-  
+
+  Security Features:
+    - Circuit Breaker: 5 failures -> open, 30s timeout, 2 successes -> close
+    - Rate Limiting:   /verify 5 req/s, /proxy 2 req/s (per phone)
+    - SSRF Protection: Ports validated against known workloads
+    - Degraded Mode:   Allows general requests when circuit is open
+
   Endpoints:
     POST /proxy     - Verify + forward to target worker (MAIN)
     POST /verify    - CAMARA verification only
     POST /infer     - Local inference (if model loaded)
     GET  /workloads - List available targets
-    GET  /health    - Health check
+    GET  /health    - Health check + circuit breaker status
+    GET  /status    - Detailed status (circuit breaker + rate limiter stats)
 ================================================================================
 """)
     
